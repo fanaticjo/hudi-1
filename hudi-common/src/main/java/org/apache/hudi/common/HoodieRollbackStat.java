@@ -42,12 +42,16 @@ public class HoodieRollbackStat implements Serializable {
   private final Map<FileStatus, Long> writtenLogFileSizeMap;
 
   public HoodieRollbackStat(String partitionPath, List<String> successDeleteFiles, List<String> failedDeleteFiles,
-      Map<FileStatus, Long> commandBlocksCount, Map<FileStatus, Long> writtenLogFileSizeMap) {
+                            Map<FileStatus, Long> commandBlocksCount, Map<FileStatus, Long> writtenLogFileSizeMap) {
     this.partitionPath = partitionPath;
     this.successDeleteFiles = successDeleteFiles;
     this.failedDeleteFiles = failedDeleteFiles;
     this.commandBlocksCount = commandBlocksCount;
     this.writtenLogFileSizeMap = writtenLogFileSizeMap;
+  }
+
+  public static HoodieRollbackStat.Builder newBuilder() {
+    return new Builder();
   }
 
   public Map<FileStatus, Long> getCommandBlocksCount() {
@@ -68,10 +72,6 @@ public class HoodieRollbackStat implements Serializable {
 
   public Map<FileStatus, Long> getWrittenLogFileSizeMap() {
     return writtenLogFileSizeMap;
-  }
-
-  public static HoodieRollbackStat.Builder newBuilder() {
-    return new Builder();
   }
 
   /**
