@@ -21,6 +21,7 @@ package org.apache.hudi.index.dynamodb;
 import org.apache.hudi.client.WriteStatus;
 import org.apache.hudi.client.common.HoodieSparkEngineContext;
 import org.apache.hudi.client.utils.SparkMemoryUtils;
+import org.apache.hudi.common.data.HoodieData;
 import org.apache.hudi.common.engine.HoodieEngineContext;
 import org.apache.hudi.common.model.EmptyHoodieRecordPayload;
 import org.apache.hudi.common.model.HoodieKey;
@@ -31,14 +32,16 @@ import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.config.HoodieWriteConfig;
+import org.apache.hudi.data.HoodieJavaRDD;
 import org.apache.hudi.exception.HoodieIndexException;
-import org.apache.hudi.index.SparkHoodieIndex;
+import org.apache.hudi.index.HoodieIndex;
 import org.apache.hudi.index.hbase.SparkHoodieHBaseIndex;
 import org.apache.hudi.table.HoodieTable;
 
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
 import com.amazonaws.services.dynamodbv2.document.BatchGetItemOutcome;
+import com.amazonaws.services.dynamodbv2.document.BatchWriteItemOutcome;
 import com.amazonaws.services.dynamodbv2.document.DynamoDB;
 import com.amazonaws.services.dynamodbv2.document.Item;
 import com.amazonaws.services.dynamodbv2.document.TableKeysAndAttributes;
@@ -62,7 +65,8 @@ import scala.Tuple2;
 /**
  * Hoodie Index implementation backed by Dynamodb.
  */
-public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload> extends SparkHoodieIndex<T> {
+public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload<T>>
+    extends HoodieIndex<T, JavaRDD<HoodieRecord<T>>, JavaRDD<HoodieKey>, JavaRDD<WriteStatus>> {
 
   private static final String PRIMARY_KEY = "primary_key";
   private static final String COMMIT_TS_COLUMN = "commit_ts";
@@ -77,12 +81,12 @@ public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload> extends Spa
 
   public SparkHoodieDynamodbIndex(HoodieWriteConfig config) {
     super(config);
-    this.tableName = config.getDynamodbTableName();
+    this.tableName = "student";
   }
 
   private DynamoDB getConnection() {
     AmazonDynamoDB client = AmazonDynamoDBClientBuilder.standard()
-        .withRegion(config.getDynamodbRegion()).build();
+        .withRegion("us-east-1").build();
     return new DynamoDB(client);
   }
 
@@ -97,11 +101,19 @@ public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload> extends Spa
   private Map<String, List<Item>> doget(List<HoodieKey> keys) {
     if (keys.size() > 0) {
       List<String> alternateKeys = new ArrayList<String>();
+      LOG.info("Hello Dynamodb Index get operation has started");
+      LOG.info(keys);
       keys.forEach(data -> {
+        LOG.info("hello checking the keys");
+        LOG.info(data.getPartitionPath());
+        LOG.info(data.getRecordKey());
         alternateKeys.add(data.getRecordKey());
         alternateKeys.add(data.getPartitionPath());
       });
-      BatchGetItemOutcome outcome = dynamodbConnection.batchGetItem(new TableKeysAndAttributes(tableName).addHashAndRangePrimaryKeys(PRIMARY_KEY, PARTITION_PATH_COLUMN, alternateKeys));
+      LOG.info("Here i am please check the alternate keys");
+      LOG.info(alternateKeys);
+      BatchGetItemOutcome outcome = dynamodbConnection
+          .batchGetItem(new TableKeysAndAttributes(tableName).addHashAndRangePrimaryKeys(PRIMARY_KEY, PARTITION_PATH_COLUMN, alternateKeys.toArray(new String[alternateKeys.size()])));
       return outcome.getTableItems();
     }
     return null;
@@ -176,7 +188,7 @@ public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload> extends Spa
    */
   @Override
   public boolean isGlobal() {
-    return false;
+    return true;
   }
 
   /**
@@ -184,7 +196,7 @@ public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload> extends Spa
    */
   @Override
   public boolean canIndexLogFiles() {
-    return false;
+    return true;
   }
 
   /**
@@ -237,6 +249,12 @@ public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload> extends Spa
       return;
     }
     TableWriteItems hudiTable = new TableWriteItems(tableName);
+    hudiTable.withItemsToPut(data);
+    LOG.info("The Crud Operation is =");
+    LOG.info(data);
+    BatchWriteItemOutcome batchWriteItemOutcome = getConnection().batchWriteItem(hudiTable);
+    LOG.info("The output is =");
+    LOG.info(batchWriteItemOutcome);
   }
 
   public Map<String, Integer> mapFileWithInsertsToUniquePartition(JavaRDD<WriteStatus> writeStatusRDD) {
@@ -253,9 +271,14 @@ public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload> extends Spa
   }
 
   @Override
-  public JavaRDD<WriteStatus> updateLocation(JavaRDD<WriteStatus> writeStatusRDD, HoodieEngineContext context,
-                                             HoodieTable<T, JavaRDD<HoodieRecord<T>>, JavaRDD<HoodieKey>,
-                                                 JavaRDD<WriteStatus>> hoodieTable) {
+  public HoodieData<HoodieRecord<T>> tagLocation(HoodieData<HoodieRecord<T>> records, HoodieEngineContext context, HoodieTable hoodieTable) throws HoodieIndexException {
+    return HoodieJavaRDD.of(HoodieJavaRDD.getJavaRDD(records)
+        .mapPartitionsWithIndex(locationTagFunction(hoodieTable.getMetaClient()), true));
+  }
+
+  @Override
+  public HoodieData<WriteStatus> updateLocation(HoodieData<WriteStatus> writeStatuses, HoodieEngineContext context, HoodieTable hoodieTable) throws HoodieIndexException {
+    JavaRDD<WriteStatus> writeStatusRDD = HoodieJavaRDD.getJavaRDD(writeStatuses);
     final Map<String, Integer> fileIdPartitionMap = mapFileWithInsertsToUniquePartition(writeStatusRDD);
     JavaRDD<WriteStatus> partitionedRDD = this.numWriteStatusWithInserts == 0 ? writeStatusRDD :
         writeStatusRDD.mapToPair(w -> new Tuple2<>(w.getFileId(), w))
@@ -269,12 +292,7 @@ public class SparkHoodieDynamodbIndex<T extends HoodieRecordPayload> extends Spa
     writeStatusJavaRDD = writeStatusJavaRDD.persist(SparkMemoryUtils.getWriteStatusStorageLevel(config.getProps()));
     // force trigger update location(hbase puts)
     writeStatusJavaRDD.count();
-    return writeStatusJavaRDD;
-  }
-
-  @Override
-  public JavaRDD<HoodieRecord<T>> tagLocation(JavaRDD records, HoodieEngineContext context, HoodieTable hoodieTable) throws HoodieIndexException {
-    return records.mapPartitionsWithIndex(locationTagFunction(hoodieTable.getMetaClient()), true);
+    return HoodieJavaRDD.of(writeStatusJavaRDD);
   }
 
   public void setDynamodbConnection(DynamoDB dynamodbConnection) {

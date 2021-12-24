@@ -100,19 +100,18 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
 
   private static final Logger LOG = LogManager.getLogger(SparkHoodieHBaseIndex.class);
   private static Connection hbaseConnection = null;
+  private static transient Thread shutdownThread;
+  private final String tableName;
   private HBaseIndexQPSResourceAllocator hBaseIndexQPSResourceAllocator = null;
   private int maxQpsPerRegionServer;
   private long totalNumInserts;
   private int numWriteStatusWithInserts;
-  private static transient Thread shutdownThread;
-
   /**
    * multiPutBatchSize will be computed and re-set in updateLocation if
    * {@link HoodieHBaseIndexConfig#PUT_BATCH_SIZE_AUTO_COMPUTE} is set to true.
    */
   private Integer multiPutBatchSize;
   private Integer numRegionServersForTable;
-  private final String tableName;
   private HBasePutBatchSizeCalculator putBatchSizeCalculator;
 
   public SparkHoodieHBaseIndex(HoodieWriteConfig config) {
@@ -133,7 +132,7 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
     try {
       LOG.info("createQPSResourceAllocator :" + config.getHBaseQPSResourceAllocatorClass());
       return (HBaseIndexQPSResourceAllocator) ReflectionUtils
-              .loadClass(config.getHBaseQPSResourceAllocatorClass(), config);
+          .loadClass(config.getHBaseQPSResourceAllocatorClass(), config);
     } catch (Exception e) {
       LOG.warn("error while instantiating HBaseIndexQPSResourceAllocator", e);
     }
@@ -210,7 +209,7 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
     // operations per second, we need to multiply `multiGetBatchSize` by 10.
     Integer multiGetBatchSize = config.getHbaseIndexGetBatchSize();
     return (Function2<Integer, Iterator<HoodieRecord<T>>, Iterator<HoodieRecord<T>>>) (partitionNum,
-        hoodieRecordIterator) -> {
+                                                                                       hoodieRecordIterator) -> {
 
       boolean updatePartitionPath = config.getHbaseIndexUpdatePartitionPath();
       RateLimiter limiter = RateLimiter.create(multiGetBatchSize * 10, TimeUnit.SECONDS);
@@ -391,7 +390,7 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
     // Map each fileId that has inserts to a unique partition Id. This will be used while
     // repartitioning RDD<WriteStatus>
     final List<String> fileIds = writeStatusRDD.filter(w -> w.getStat().getNumInserts() > 0)
-                                   .map(w -> w.getFileId()).collect();
+        .map(w -> w.getFileId()).collect();
     for (final String fileId : fileIds) {
       fileIdPartitionMap.put(fileId, partitionIndex++);
     }
@@ -429,7 +428,7 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
         If a writeStatus has any insert, it implies that the corresponding task contacts HBase for
         doing puts, since we only do puts for inserts from HBaseIndex.
        */
-      final Tuple2<Long, Integer> numPutsParallelismTuple  = getHBasePutAccessParallelism(writeStatusRDD);
+      final Tuple2<Long, Integer> numPutsParallelismTuple = getHBasePutAccessParallelism(writeStatusRDD);
       this.totalNumInserts = numPutsParallelismTuple._1;
       this.numWriteStatusWithInserts = numPutsParallelismTuple._2;
       this.numRegionServersForTable = getNumRegionServersAliveForTable();
@@ -450,18 +449,18 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
       int maxExecutors = conf.getInt(DEFAULT_SPARK_EXECUTOR_INSTANCES_CONFIG_NAME, 1);
       if (conf.getBoolean(DEFAULT_SPARK_DYNAMIC_ALLOCATION_ENABLED_CONFIG_NAME, false)) {
         maxExecutors = Math.max(maxExecutors, conf.getInt(
-          DEFAULT_SPARK_DYNAMIC_ALLOCATION_MAX_EXECUTORS_CONFIG_NAME, 1));
+            DEFAULT_SPARK_DYNAMIC_ALLOCATION_MAX_EXECUTORS_CONFIG_NAME, 1));
       }
       final float availableQpsFraction = this.hBaseIndexQPSResourceAllocator
-                                           .acquireQPSResources(desiredQPSFraction.get(), this.totalNumInserts);
+          .acquireQPSResources(desiredQPSFraction.get(), this.totalNumInserts);
       LOG.info("Allocated QPS Fraction :" + availableQpsFraction);
       multiPutBatchSize = putBatchSizeCalculator
-                            .getBatchSize(
-                              numRegionServersForTable,
-                              maxQpsPerRegionServer,
-                              numWriteStatusWithInserts,
-                              maxExecutors,
-                              availableQpsFraction);
+          .getBatchSize(
+              numRegionServersForTable,
+              maxQpsPerRegionServer,
+              numWriteStatusWithInserts,
+              maxExecutors,
+              availableQpsFraction);
       LOG.info("multiPutBatchSize :" + multiPutBatchSize);
     }
   }
@@ -470,65 +469,6 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
     final JavaPairRDD<Long, Integer> insertOnlyWriteStatusRDD = writeStatusRDD
         .filter(w -> w.getStat().getNumInserts() > 0).mapToPair(w -> new Tuple2<>(w.getStat().getNumInserts(), 1));
     return insertOnlyWriteStatusRDD.fold(new Tuple2<>(0L, 0), (w, c) -> new Tuple2<>(w._1 + c._1, w._2 + c._2));
-  }
-
-  public static class HBasePutBatchSizeCalculator implements Serializable {
-
-    private static final Logger LOG = LogManager.getLogger(HBasePutBatchSizeCalculator.class);
-
-    /**
-     * Calculate putBatch size so that sum of requests across multiple jobs in a second does not exceed
-     * maxQpsPerRegionServer for each Region Server. Multiplying qpsFraction to reduce the aggregate load on common RS
-     * across topics. Assumption here is that all tables have regions across all RS, which is not necessarily true for
-     * smaller tables. So, they end up getting a smaller share of QPS than they deserve, but it might be ok.
-     * <p>
-     * Example: int putBatchSize = batchSizeCalculator.getBatchSize(10, 16667, 1200, 200, 100, 0.1f)
-     * </p>
-     * <p>
-     * Expected batchSize is 8 because in that case, total request sent to a Region Server in one second is:
-     *
-     * 8 (batchSize) * 200 (parallelism) * 10 (maxReqsInOneSecond) * 10 (numRegionServers) * 0.1 (qpsFraction)) =>
-     * 16000. We assume requests get distributed to Region Servers uniformly, so each RS gets 1600 requests which
-     * happens to be 10% of 16667 (maxQPSPerRegionServer), as expected.
-     * </p>
-     * <p>
-     * Assumptions made here
-     * <li>In a batch, writes get evenly distributed to each RS for that table. Since we do writes only in the case of
-     * inserts and not updates, for this assumption to fail, inserts would have to be skewed towards few RS, likelihood
-     * of which is less if Hbase table is pre-split and rowKeys are UUIDs (random strings). If this assumption fails,
-     * then it is possible for some RS to receive more than maxQpsPerRegionServer QPS, but for simplicity, we are going
-     * ahead with this model, since this is meant to be a lightweight distributed throttling mechanism without
-     * maintaining a global context. So if this assumption breaks, we are hoping the HBase Master relocates hot-spot
-     * regions to new Region Servers.
-     *
-     * </li>
-     * <li>For Region Server stability, throttling at a second level granularity is fine. Although, within a second, the
-     * sum of queries might be within maxQpsPerRegionServer, there could be peaks at some sub second intervals. So, the
-     * assumption is that these peaks are tolerated by the Region Server (which at max can be maxQpsPerRegionServer).
-     * </li>
-     * </p>
-     */
-    public int getBatchSize(int numRegionServersForTable, int maxQpsPerRegionServer,
-                            int numTasksDuringPut, int maxExecutors, float qpsFraction) {
-      int numRSAlive = numRegionServersForTable;
-      int maxReqPerSec = getMaxReqPerSec(numRSAlive, maxQpsPerRegionServer, qpsFraction);
-      int numTasks = numTasksDuringPut;
-      int maxParallelPutsTask = Math.max(1, Math.min(numTasks, maxExecutors));
-      int multiPutBatchSizePerSecPerTask = Math.max(1, (int) Math.ceil(maxReqPerSec / maxParallelPutsTask));
-      LOG.info("HbaseIndexThrottling: qpsFraction :" + qpsFraction);
-      LOG.info("HbaseIndexThrottling: numRSAlive :" + numRSAlive);
-      LOG.info("HbaseIndexThrottling: maxReqPerSec :" + maxReqPerSec);
-      LOG.info("HbaseIndexThrottling: numTasks :" + numTasks);
-      LOG.info("HbaseIndexThrottling: maxExecutors :" + maxExecutors);
-      LOG.info("HbaseIndexThrottling: maxParallelPuts :" + maxParallelPutsTask);
-      LOG.info("HbaseIndexThrottling: numRegionServersForTable :" + numRegionServersForTable);
-      LOG.info("HbaseIndexThrottling: multiPutBatchSizePerSecPerTask :" + multiPutBatchSizePerSecPerTask);
-      return multiPutBatchSizePerSecPerTask;
-    }
-
-    public int getMaxReqPerSec(int numRegionServersForTable, int maxQpsPerRegionServer, float qpsFraction) {
-      return (int) (qpsFraction * numRegionServersForTable * maxQpsPerRegionServer);
-    }
   }
 
   private Integer getNumRegionServersAliveForTable() {
@@ -583,7 +523,7 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
         currentVersionResults.add(result);
         statements.add(generateStatement(Bytes.toString(result.getRow()), 0L, rollbackTime - 1));
 
-        if (scannerIterator.hasNext() &&  statements.size() < multiGetBatchSize) {
+        if (scannerIterator.hasNext() && statements.size() < multiGetBatchSize) {
           continue;
         }
         Result[] lastVersionResults = hTable.get(statements);
@@ -647,14 +587,73 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
     SparkHoodieHBaseIndex.hbaseConnection = hbaseConnection;
   }
 
+  public static class HBasePutBatchSizeCalculator implements Serializable {
+
+    private static final Logger LOG = LogManager.getLogger(HBasePutBatchSizeCalculator.class);
+
+    /**
+     * Calculate putBatch size so that sum of requests across multiple jobs in a second does not exceed
+     * maxQpsPerRegionServer for each Region Server. Multiplying qpsFraction to reduce the aggregate load on common RS
+     * across topics. Assumption here is that all tables have regions across all RS, which is not necessarily true for
+     * smaller tables. So, they end up getting a smaller share of QPS than they deserve, but it might be ok.
+     * <p>
+     * Example: int putBatchSize = batchSizeCalculator.getBatchSize(10, 16667, 1200, 200, 100, 0.1f)
+     * </p>
+     * <p>
+     * Expected batchSize is 8 because in that case, total request sent to a Region Server in one second is:
+     * <p>
+     * 8 (batchSize) * 200 (parallelism) * 10 (maxReqsInOneSecond) * 10 (numRegionServers) * 0.1 (qpsFraction)) =>
+     * 16000. We assume requests get distributed to Region Servers uniformly, so each RS gets 1600 requests which
+     * happens to be 10% of 16667 (maxQPSPerRegionServer), as expected.
+     * </p>
+     * <p>
+     * Assumptions made here
+     * <li>In a batch, writes get evenly distributed to each RS for that table. Since we do writes only in the case of
+     * inserts and not updates, for this assumption to fail, inserts would have to be skewed towards few RS, likelihood
+     * of which is less if Hbase table is pre-split and rowKeys are UUIDs (random strings). If this assumption fails,
+     * then it is possible for some RS to receive more than maxQpsPerRegionServer QPS, but for simplicity, we are going
+     * ahead with this model, since this is meant to be a lightweight distributed throttling mechanism without
+     * maintaining a global context. So if this assumption breaks, we are hoping the HBase Master relocates hot-spot
+     * regions to new Region Servers.
+     *
+     * </li>
+     * <li>For Region Server stability, throttling at a second level granularity is fine. Although, within a second, the
+     * sum of queries might be within maxQpsPerRegionServer, there could be peaks at some sub second intervals. So, the
+     * assumption is that these peaks are tolerated by the Region Server (which at max can be maxQpsPerRegionServer).
+     * </li>
+     * </p>
+     */
+    public int getBatchSize(int numRegionServersForTable, int maxQpsPerRegionServer,
+                            int numTasksDuringPut, int maxExecutors, float qpsFraction) {
+      int numRSAlive = numRegionServersForTable;
+      int maxReqPerSec = getMaxReqPerSec(numRSAlive, maxQpsPerRegionServer, qpsFraction);
+      int numTasks = numTasksDuringPut;
+      int maxParallelPutsTask = Math.max(1, Math.min(numTasks, maxExecutors));
+      int multiPutBatchSizePerSecPerTask = Math.max(1, (int) Math.ceil(maxReqPerSec / maxParallelPutsTask));
+      LOG.info("HbaseIndexThrottling: qpsFraction :" + qpsFraction);
+      LOG.info("HbaseIndexThrottling: numRSAlive :" + numRSAlive);
+      LOG.info("HbaseIndexThrottling: maxReqPerSec :" + maxReqPerSec);
+      LOG.info("HbaseIndexThrottling: numTasks :" + numTasks);
+      LOG.info("HbaseIndexThrottling: maxExecutors :" + maxExecutors);
+      LOG.info("HbaseIndexThrottling: maxParallelPuts :" + maxParallelPutsTask);
+      LOG.info("HbaseIndexThrottling: numRegionServersForTable :" + numRegionServersForTable);
+      LOG.info("HbaseIndexThrottling: multiPutBatchSizePerSecPerTask :" + multiPutBatchSizePerSecPerTask);
+      return multiPutBatchSizePerSecPerTask;
+    }
+
+    public int getMaxReqPerSec(int numRegionServersForTable, int maxQpsPerRegionServer, float qpsFraction) {
+      return (int) (qpsFraction * numRegionServersForTable * maxQpsPerRegionServer);
+    }
+  }
+
   /**
    * Partitions each WriteStatus with inserts into a unique single partition. WriteStatus without inserts will be
    * assigned to random partitions. This partitioner will be useful to utilize max parallelism with spark operations
    * that are based on inserts in each WriteStatus.
    */
   public static class WriteStatusPartitioner extends Partitioner {
-    private int totalPartitions;
     final Map<String, Integer> fileIdPartitionMap;
+    private int totalPartitions;
 
     public WriteStatusPartitioner(final Map<String, Integer> fileIdPartitionMap, final int totalPartitions) {
       this.totalPartitions = totalPartitions;
@@ -671,7 +670,7 @@ public class SparkHoodieHBaseIndex<T extends HoodieRecordPayload<T>>
       final String fileId = (String) key;
       if (!fileIdPartitionMap.containsKey(fileId)) {
         LOG.info("This writestatus(fileId: " + fileId + ") is not mapped because it doesn't have any inserts. "
-                 + "In this case, we can assign a random partition to this WriteStatus.");
+            + "In this case, we can assign a random partition to this WriteStatus.");
         // Assign random spark partition for the `WriteStatus` that has no inserts. For a spark operation that depends
         // on number of inserts, there won't be any performance penalty in packing these WriteStatus'es together.
         return Math.abs(fileId.hashCode()) % totalPartitions;

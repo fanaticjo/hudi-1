@@ -28,6 +28,7 @@ import org.apache.hudi.exception.HoodieIndexException;
 import org.apache.hudi.index.bloom.HoodieBloomIndex;
 import org.apache.hudi.index.bloom.HoodieGlobalBloomIndex;
 import org.apache.hudi.index.bloom.SparkHoodieBloomIndexHelper;
+import org.apache.hudi.index.dynamodb.SparkHoodieDynamodbIndex;
 import org.apache.hudi.index.hbase.SparkHoodieHBaseIndex;
 import org.apache.hudi.index.inmemory.HoodieInMemoryHashIndex;
 import org.apache.hudi.index.simple.HoodieGlobalSimpleIndex;
@@ -63,6 +64,8 @@ public final class SparkHoodieIndexFactory {
         return new HoodieSimpleIndex<>(config, getKeyGeneratorForSimpleIndex(config));
       case GLOBAL_SIMPLE:
         return new HoodieGlobalSimpleIndex<>(config, getKeyGeneratorForSimpleIndex(config));
+      case DYNAMODB:
+        return new SparkHoodieDynamodbIndex<>(config);
       default:
         throw new HoodieIndexException("Index type unspecified, set " + config.getIndexType());
     }
@@ -70,6 +73,7 @@ public final class SparkHoodieIndexFactory {
 
   /**
    * Whether index is global or not.
+   *
    * @param config HoodieWriteConfig to use.
    * @return {@code true} if index is a global one. else {@code false}.
    */
